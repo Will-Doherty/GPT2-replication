@@ -35,7 +35,7 @@ def train_model(model_cfg, training_cfg):
 
     model = Transformer(model_cfg)
     model.to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
