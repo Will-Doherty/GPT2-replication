@@ -3,14 +3,22 @@ from dataclasses import dataclass
 
 @dataclass
 class TrainingConfig:
-    training_batch_size = 16
-    learning_rate = 1e-4
+    max_seq_len = 1024
+    minibatch_size = 16
+    total_batch_size = 2 ** 19  # from gpt-3 paper
+    grad_accum_steps = total_batch_size // (minibatch_size * max_seq_len)
+    device = "cuda"
+    max_learning_rate = 6e-4
+    min_learning_rate = max_learning_rate * 0.1
+    warmup_tokens = 1e9  # 100m warmup tokens i.e. 1% of total training dataset
+    warmup_steps = warmup_tokens // total_batch_size
+    total_steps = 1e11 // total_batch_size
     num_epochs = 1
-    model_save_path = 'model_weights_and_results/model.pth'
-    loss_save_path = 'model_weights_and_results/losses.json'
-    weight_decay = 0
+    model_save_path = 'model.pth'
+    loss_save_path = 'losses.json'
+    weight_decay = 0.1
     
-@dataclass    
+@dataclass
 class ModelConfig:
     vocab_size = 50304
     max_seq_len = 1024
