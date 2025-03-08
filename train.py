@@ -25,7 +25,7 @@ def save_losses(training_losses, validation_losses):
 
 def train_model(model_cfg, training_cfg):
     torch_dataset = get_data()
-    batched_dataset = torch_dataset.batch(batch_size=training_cfg.training_batch_size)
+    batched_dataset = torch_dataset.batch(batch_size=training_cfg.minibatch_size)
 
     device = model_cfg.device
     torch.set_float32_matmul_precision('medium')
