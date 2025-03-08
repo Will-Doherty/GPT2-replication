@@ -31,12 +31,16 @@ def train_model(model_cfg, training_cfg):
     device = model_cfg.device
     torch.set_float32_matmul_precision('medium')
 
-    torch.manual_seed(123)
+    torch.manual_seed_all(123)
     torch.cuda.manual_seed(123)
 
     model = Transformer(model_cfg)
     model.to(device)
     # model = torch.compile(model)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Found {torch.cuda.device_count()} GPUs. Using DataParallel.")
+        model = torch.nn.DataParallel(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
