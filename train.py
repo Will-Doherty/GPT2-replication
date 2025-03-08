@@ -7,6 +7,7 @@ from configs import TrainingConfig
 import math
 from statistics import mean
 from torch.optim.lr_scheduler import LambdaLR
+import time
 
 def save_state_dict(model, optimizer):
     torch.save({
@@ -63,6 +64,7 @@ def train_model(model_cfg, training_cfg):
     accumulation_counter = 0
     current_step = 0
 
+    start_time = time.time()
     for i, dset_dict in enumerate(batched_dataset):
         max_input_len = max(tensor.size(0) for tensor in dset_dict['input_ids'])
         inputs = [torch.cat([tensor, torch.full([max_input_len - tensor.size(0)], 50256)])[:model_cfg.max_seq_len] for tensor in dset_dict['input_ids']]
@@ -93,6 +95,9 @@ def train_model(model_cfg, training_cfg):
 
     save_state_dict(model, optimizer, training_cfg)
     save_losses(training_losses, validation_losses, training_cfg)
+
+    end_time = time.time()
+    print(f"Training time: {end_time - start_time:.2f} seconds")
 
     return model, training_losses, validation_losses, optimizer
 
