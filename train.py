@@ -4,9 +4,9 @@ import json
 from model_def import ModelConfig, Transformer
 from load_data import get_data
 from configs import TrainingConfig
-from torch.nn.utils import clip_grad_norm_
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+import math
+from statistics import mean
+from torch.optim.lr_scheduler import LambdaLR
 
 def save_state_dict(model, optimizer):
     torch.save({
@@ -38,17 +38,32 @@ def train_model(model_cfg, training_cfg):
     model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=training_cfg.learning_rate, 
+        model.parameters(),
+        lr=training_cfg.max_learning_rate,
+        betas=(0.9, 0.95),
         weight_decay=training_cfg.weight_decay
     )
 
-    validation_losses = []
-    training_losses = []
+    def lr_lambda(current_step):
+        if current_step <= training_cfg.warmup_steps:
+            warmup_ratio = current_step / float(training_cfg.warmup_steps)
+            lr = training_cfg.min_learning_rate + (training_cfg.max_learning_rate - training_cfg.min_learning_rate) * warmup_ratio
+        else:
+            progress = (current_step - training_cfg.warmup_steps) / float(training_cfg.total_steps - training_cfg.warmup_steps)
+            lr = (training_cfg.min_learning_rate
+                  + 0.5 * (training_cfg.max_learning_rate - training_cfg.min_learning_rate)
+                  * (1 + math.cos(math.pi * progress)))
+        return lr / training_cfg.max_learning_rate
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     model.train()
+    training_losses = []
+    validation_losses = []
+    accumulation_counter = 0
+    current_step = 0
 
-    for step, dset_dict in enumerate(batched_dataset):
+    for i, dset_dict in enumerate(batched_dataset):
         max_input_len = max(tensor.size(0) for tensor in dset_dict['input_ids'])
         inputs = [torch.cat([tensor, torch.full([max_input_len - tensor.size(0)], 50256)])[:model_cfg.max_seq_len] for tensor in dset_dict['input_ids']]
         max_target_len = max(tensor.size(0) for tensor in dset_dict['labels'])
@@ -56,25 +71,28 @@ def train_model(model_cfg, training_cfg):
         x = torch.stack(inputs)
         y = torch.stack(targets)
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
-        if step % 10 != 0 or step == 0:
-            if step % 10 == 9:
-                training_losses.append(loss.item())
-            loss.backward()
+        logits = model(x)
+        raw_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        training_losses.append(raw_loss.item())
+
+        loss = raw_loss / training_cfg.grad_accum_steps
+        loss.backward()
+        accumulation_counter += 1
+
+        if accumulation_counter % training_cfg.grad_accum_steps == 0:
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
-        else:
-            validation_losses.append(loss.item())
-            print(f"Step {step}: training loss = {training_losses[-1]}, validation loss = {loss.item()}")
+            current_step += 1
 
-        if step > 0 and step % 30 == 0:
-            break
+        if i > 0 and i % 10 == 0:
+            recent_mean_loss = mean(training_losses[-10:])
+            print(f"Minibatch {i}: training loss (avg of last 10) = {recent_mean_loss:.4f}")
 
-    save_state_dict(model, optimizer)
-    save_losses(training_losses, validation_losses)
+    save_state_dict(model, optimizer, training_cfg)
+    save_losses(training_losses, validation_losses, training_cfg)
 
     return model, training_losses, validation_losses, optimizer
 
