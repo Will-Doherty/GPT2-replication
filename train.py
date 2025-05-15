@@ -49,15 +49,15 @@ def train_model(model_cfg, training_cfg):
     torch.cuda.manual_seed_all(123)
 
     core = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    rank, world_size = get_rank_and_world_size()
     hidden_matrix_params = [p for p in core.layers.parameters() if p.ndim == 2]
     scalar_params = [p for p in core.layers.parameters() if p.ndim == 1]
     embed_params = [p for n, p in core.named_parameters() if "embed" in n]
-    adam_params = [dict(params=embed_params, lr=0.005),
-                dict(params=scalar_params, lr=0.005)
+    adam_params = [dict(params=embed_params, lr=0.005 * world_size),
+                dict(params=scalar_params, lr=0.005 * world_size)
                 ]
     adam_optimizer = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-    rank, world_size = get_rank_and_world_size()
-    muon_optimizer = Muon(hidden_matrix_params, lr=0.005, momentum=0.95, rank=rank, world_size=world_size, device=local_device)
+    muon_optimizer = Muon(hidden_matrix_params, lr=0.005 * world_size, momentum=0.95, rank=rank, world_size=world_size, device=local_device)
     optimizers = [adam_optimizer, muon_optimizer]
     for optimizer in optimizers:
         for group in optimizer.param_groups:
