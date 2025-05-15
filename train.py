@@ -1,109 +1,131 @@
 import torch
 import torch.nn.functional as F
 import json
-from model_def import ModelConfig, Transformer
 from load_data import get_data
-from configs import TrainingConfig
+from configs import TrainingConfig, ModelConfig
 import math
 from statistics import mean
-from torch.optim.lr_scheduler import LambdaLR
 import time
+from optimizers import Muon
+import os
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from model_def import Transformer
+from torch.amp import autocast, GradScaler
+import argparse
+import torch._dynamo
 
-def save_state_dict(model, optimizer):
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict()
-    }, TrainingConfig.model_save_path)
-    print(f"Model saved to {TrainingConfig.model_save_path}")
+def get_rank_and_world_size():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return 0, 1
 
-def save_losses(training_losses, validation_losses):
-    with open(TrainingConfig.loss_save_path, 'w') as f:
+def save_losses(training_losses, training_cfg):
+    with open(training_cfg.loss_save_path, 'w') as f:
         json.dump({
             'training_losses': training_losses,
-            'validation_losses': validation_losses
         }, f)
-    print(f"Losses saved to {TrainingConfig.loss_save_path}")
+    print(f"Losses saved to {training_cfg.loss_save_path}")
 
 def train_model(model_cfg, training_cfg):
-    torch_dataset = get_data()
-    batched_dataset = torch_dataset.batch(batch_size=training_cfg.minibatch_size)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    local_device = torch.device("cuda", local_rank)
+    print(f"Using {local_device}")
 
-    device = model_cfg.device
-    torch.set_float32_matmul_precision('medium')
+    model = Transformer(model_cfg)
 
+    model.to(local_device).bfloat16()
+    torch._dynamo.config.suppress_errors = True
+    model = torch.compile(model, dynamic=False)
+
+    multi = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if multi and not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+        model = torch.nn.DistributedDataParallel(model, device_ids=[local_rank])
+    
+    if dist.is_initialized():
+        dist.barrier()
     torch.manual_seed(123)
     torch.cuda.manual_seed_all(123)
 
-    model = Transformer(model_cfg)
-    model.to(device)
-    # model = torch.compile(model)
+    core = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    hidden_matrix_params = [p for p in core.layers.parameters() if p.ndim == 2]
+    scalar_params = [p for p in core.layers.parameters() if p.ndim == 1]
+    embed_params = [p for n, p in core.named_parameters() if "embed" in n]
+    adam_params = [dict(params=embed_params, lr=0.005),
+                dict(params=scalar_params, lr=0.005)
+                ]
+    adam_optimizer = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    rank, world_size = get_rank_and_world_size()
+    muon_optimizer = Muon(hidden_matrix_params, lr=0.005, momentum=0.95, rank=rank, world_size=world_size, device=local_device)
+    optimizers = [adam_optimizer, muon_optimizer]
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
 
-    if torch.cuda.device_count() > 1:
-        print(f"Found {torch.cuda.device_count()} GPUs. Using DataParallel.")
-        model = torch.nn.DataParallel(model)
+    torch.set_float32_matmul_precision("medium")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training_cfg.max_learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=training_cfg.weight_decay
+    torch.cuda.set_device(local_rank)
+    
+    def lr_mult_adam(step: int, total_steps: int) -> float:
+        if step < training_cfg.warmup_steps:
+            return step / training_cfg.warmup_steps
+        progress = step / total_steps
+        if progress < 1 - training_cfg.cooldown_frac:
+            return 1.0
+        w = (1 - progress) / training_cfg.cooldown_frac
+        return w + (1 - w) * 0.1
+
+    def lr_mult_muon(step: int, total_steps: int) -> float:
+        progress = step / total_steps
+        if progress < 1 - training_cfg.cooldown_frac:
+            return 1.0
+        w = (1 - progress) / training_cfg.cooldown_frac
+        return w + (1 - w) * 0.1
+
+    dset = get_data(rank, world_size)
+    
+    batched_dataset = DataLoader(
+        dset,
+        batch_size=training_cfg.minibatch_size,
+        num_workers=training_cfg.num_dataloader_workers,
+        pin_memory=True
     )
 
-    def lr_lambda(current_step):
-        if current_step <= training_cfg.warmup_steps:
-            warmup_ratio = current_step / float(training_cfg.warmup_steps)
-            lr = training_cfg.min_learning_rate + (training_cfg.max_learning_rate - training_cfg.min_learning_rate) * warmup_ratio
-        else:
-            progress = (current_step - training_cfg.warmup_steps) / float(training_cfg.total_steps - training_cfg.warmup_steps)
-            lr = (training_cfg.min_learning_rate
-                  + 0.5 * (training_cfg.max_learning_rate - training_cfg.min_learning_rate)
-                  * (1 + math.cos(math.pi * progress)))
-        return lr / training_cfg.max_learning_rate
-
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-
+    scaler = GradScaler()
     model.train()
     training_losses = []
-    validation_losses = []
-    accumulation_counter = 0
-    current_step = 0
-
     start_time = time.time()
-    for i, dset_dict in enumerate(batched_dataset):
-        max_input_len = max(tensor.size(0) for tensor in dset_dict['input_ids'])
-        inputs = [torch.cat([tensor, torch.full([max_input_len - tensor.size(0)], 50256)])[:model_cfg.max_seq_len] for tensor in dset_dict['input_ids']]
-        max_target_len = max(tensor.size(0) for tensor in dset_dict['labels'])
-        targets = [torch.cat([tensor, torch.full([max_target_len - tensor.size(0)], 50256)])[:model_cfg.max_seq_len] for tensor in dset_dict['labels']]
-        x = torch.stack(inputs)
-        y = torch.stack(targets)
-        x, y = x.to(device), y.to(device)
+    for ministep, batch in enumerate(batched_dataset):
+        x = batch["input_ids"].to(local_device, non_blocking=True)
+        y = batch["labels"].to(local_device, non_blocking=True)
+        with autocast(device_type=local_device.type, dtype=torch.bfloat16):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        training_losses.append(loss.item())
+        scaler.scale(loss).backward()
 
-        logits = model(x)
-        raw_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-        training_losses.append(raw_loss.item())
+        for group in adam_optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lr_mult_adam(ministep, training_cfg.total_steps)
+        for group in muon_optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lr_mult_muon(ministep, training_cfg.total_steps)
+        mu_frac = min(1.0, ministep / training_cfg.muon_momentum_warmup_steps)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = (1 - mu_frac) * training_cfg.momentum_coef1 + mu_frac * training_cfg.momentum_coef2
 
-        loss = raw_loss / training_cfg.grad_accum_steps
-        loss.backward()
-        accumulation_counter += 1
+        for opt in optimizers:
+            scaler.step(opt)
+        scaler.update()
+        model.zero_grad(set_to_none=True)
 
-        if accumulation_counter % training_cfg.grad_accum_steps == 0:
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+        if ministep > 0 and ministep % training_cfg.print_loss_stride == 0:
+            minibatch_time = (time.time() - start_time) / training_cfg.print_loss_stride
+            recent_mean_loss = mean(training_losses[-training_cfg.print_loss_stride:])
+            print(f"Minibatch {ministep}: training loss (avg of last {training_cfg.print_loss_stride}) = {recent_mean_loss:.4f}, time = {minibatch_time}")
+            start_time = time.time()
 
-            current_step += 1
-
-        if i > 0 and i % 10 == 0:
-            recent_mean_loss = mean(training_losses[-10:])
-            print(f"Minibatch {i}: training loss (avg of last 10) = {recent_mean_loss:.4f}")
-
-    save_state_dict(model, optimizer, training_cfg)
-    save_losses(training_losses, validation_losses, training_cfg)
-
-    end_time = time.time()
-    print(f"Training time: {end_time - start_time:.2f} seconds")
-
-    return model, training_losses, validation_losses, optimizer
+    if rank == 0:
+        save_losses(training_losses, training_cfg)
 
 
 if __name__ == '__main__':
