@@ -18,6 +18,7 @@ class TrainingConfig:
     print_loss_stride = 10
     momentum_coef1 = 0.85
     momentum_coef2 = 0.95
+    target_loss = 3.28
     
 @dataclass    
 class ModelConfig:

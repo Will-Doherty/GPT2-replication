@@ -124,6 +124,9 @@ def train_model(model_cfg, training_cfg):
             print(f"Minibatch {ministep}: training loss (avg of last {training_cfg.print_loss_stride}) = {recent_mean_loss:.4f}, time = {minibatch_time}")
             start_time = time.time()
 
+        if recent_mean_loss < training_cfg.target_loss:
+            break
+
     if rank == 0:
         save_losses(training_losses, training_cfg)
 
