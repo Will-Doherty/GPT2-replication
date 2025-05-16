@@ -41,7 +41,7 @@ def train_model(model_cfg, training_cfg):
     multi = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if multi and not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
-        model = torch.nn.DistributedDataParallel(model, device_ids=[local_rank])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     
     if dist.is_initialized():
         dist.barrier()
